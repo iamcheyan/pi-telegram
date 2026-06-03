@@ -227,9 +227,11 @@ class PiRpcClient {
         const name = event.toolName as string;
         const args = event.args as Record<string, unknown> | undefined;
         if (name === "bash") {
-          this.responseText += `\n[tool: bash] ${(args?.command as string ?? "").slice(0, 100)}\n`;
+          const cmd = (args?.command as string ?? "").slice(0, 100);
+          this.responseText += `\n🔧 *bash*\n\`\`\`\n${cmd}\n\`\`\`\n`;
         } else if (name === "read") {
-          this.responseText += `\n[tool: read] ${args?.path as string ?? ""}\n`;
+          const path = args?.path as string ?? "";
+          this.responseText += `\n📖 *read* \`${path}\`\n`;
         }
         break;
       }
@@ -297,6 +299,75 @@ class PiRpcClient {
   }
 }
 
+// --- Telegram MarkdownV2 Formatting ---
+
+function escapeMarkdownV2(text: string): string {
+  // Escape special characters for MarkdownV2
+  // Characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+}
+
+function formatForTelegram(text: string): string {
+  // Split text into parts: code blocks and regular text
+  const parts: string[] = [];
+  let current = '';
+  let inCodeBlock = false;
+  let codeBlockContent = '';
+  let codeBlockLang = '';
+
+  const lines = text.split('\n');
+
+  for (const line of lines) {
+    // Check for code block start/end
+    if (line.startsWith('```') && !inCodeBlock) {
+      // Start of code block
+      if (current.trim()) {
+        parts.push(escapeMarkdownV2(current));
+        current = '';
+      }
+      inCodeBlock = true;
+      codeBlockLang = line.slice(3).trim();
+      codeBlockContent = '';
+      continue;
+    }
+
+    if (line.startsWith('```') && inCodeBlock) {
+      // End of code block
+      inCodeBlock = false;
+      if (codeBlockLang) {
+        parts.push(`\`\`\`${codeBlockLang}\n${codeBlockContent}\n\`\`\``);
+      } else {
+        parts.push(`\`\`\`\n${codeBlockContent}\n\`\`\``);
+      }
+      codeBlockContent = '';
+      codeBlockLang = '';
+      continue;
+    }
+
+    if (inCodeBlock) {
+      codeBlockContent += (codeBlockContent ? '\n' : '') + line;
+    } else {
+      current += (current ? '\n' : '') + line;
+    }
+  }
+
+  // Handle unclosed code block
+  if (inCodeBlock) {
+    if (codeBlockLang) {
+      parts.push(`\`\`\`${codeBlockLang}\n${codeBlockContent}\n\`\`\``);
+    } else {
+      parts.push(`\`\`\`\n${codeBlockContent}\n\`\`\``);
+    }
+  }
+
+  // Add remaining text
+  if (current.trim()) {
+    parts.push(escapeMarkdownV2(current));
+  }
+
+  return parts.join('\n');
+}
+
 // --- Telegram Bot with 409 retry ---
 
 async function startBot(pi: PiRpcClient): Promise<void> {
@@ -345,8 +416,16 @@ async function startBot(pi: PiRpcClient): Promise<void> {
 
     console.log(`[tg] -> ${filteredText.slice(0, 100)}`);
     for (const chunk of splitMessage(filteredText, 4096)) {
-      try { await bot.api.sendMessage(chatId, chunk); }
-      catch (err) { console.error("[tg] send error:", err); }
+      try {
+        // Try to send with MarkdownV2 format
+        const formattedChunk = formatForTelegram(chunk);
+        await bot.api.sendMessage(chatId, formattedChunk, { parse_mode: "MarkdownV2" });
+      } catch (err) {
+        // If MarkdownV2 fails, send as plain text
+        console.error("[tg] markdown error, sending as plain text:", err);
+        try { await bot.api.sendMessage(chatId, chunk); }
+        catch (err2) { console.error("[tg] send error:", err2); }
+      }
     }
   };
 
