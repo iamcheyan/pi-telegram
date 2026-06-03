@@ -14,7 +14,7 @@
 
 import { Bot, webhookCallback } from "grammy";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { platform, arch } from "node:os";
@@ -85,12 +85,119 @@ function loadConfig(): TelegramConfig {
 }
 
 const config = loadConfig();
+const sessionsDir = resolve(process.env.HOME ?? "~", ".pi", "agent", "sessions", "telegram");
+const sessionPath = resolve(sessionsDir, `chat-${config.chatId}.jsonl`);
+
+class StreamSender {
+  private chatId: number;
+  private bot: Bot;
+  private draftId = Math.floor(Math.random() * 1000000) + 1;
+  private mode: "draft" | "edit" | "detecting" = "detecting";
+  private messageId: number | null = null;
+  private lastText = "";
+  
+  constructor(chatId: number, bot: Bot) {
+    this.chatId = chatId;
+    this.bot = bot;
+  }
+  
+  async sendUpdate(text: string) {
+    if (!text.trim()) return;
+    this.lastText = text;
+    
+    const formattedText = markdownToHtml(text);
+    
+    if (this.mode === "detecting") {
+      try {
+        // Try calling sendMessageDraft
+        await this.bot.api.raw.makeRequest("sendMessageDraft", {
+          chat_id: this.chatId,
+          draft_id: this.draftId,
+          text: formattedText,
+          parse_mode: "HTML"
+        });
+        this.mode = "draft";
+        return;
+      } catch (err) {
+        console.log("[tg] sendMessageDraft not supported or failed, falling back to editMessageText:", err);
+        this.mode = "edit";
+        // Send initial message for edit mode
+        const msg = await this.bot.api.sendMessage(this.chatId, formattedText, { parse_mode: "HTML" });
+        this.messageId = msg.message_id;
+        return;
+      }
+    }
+    
+    if (this.mode === "draft") {
+      try {
+        await this.bot.api.raw.makeRequest("sendMessageDraft", {
+          chat_id: this.chatId,
+          draft_id: this.draftId,
+          text: formattedText,
+          parse_mode: "HTML"
+        });
+      } catch (err) {
+        console.error("[tg] draft update error:", err);
+      }
+    } else if (this.mode === "edit" && this.messageId !== null) {
+      try {
+        await this.bot.api.editMessageText(this.chatId, this.messageId, formattedText, { parse_mode: "HTML" });
+      } catch (err) {
+        const isNotModified = err instanceof Error && err.message.includes("message is not modified");
+        if (!isNotModified) {
+          console.error("[tg] edit update error:", err);
+        }
+      }
+    }
+  }
+  
+  async finalize(text: string) {
+    const chunks = splitMessage(text || this.lastText || "(no response)", 4096);
+    
+    if (this.mode === "draft") {
+      for (const chunk of chunks) {
+        const formatted = markdownToHtml(chunk);
+        await this.bot.api.sendMessage(this.chatId, formatted, { parse_mode: "HTML" });
+      }
+    } else if (this.mode === "edit" && this.messageId !== null) {
+      const firstChunkFormatted = markdownToHtml(chunks[0] || "(no response)");
+      try {
+        await this.bot.api.editMessageText(this.chatId, this.messageId, firstChunkFormatted, { parse_mode: "HTML" });
+      } catch (err) {
+        const isNotModified = err instanceof Error && err.message.includes("message is not modified");
+        if (!isNotModified) {
+          try {
+            await this.bot.api.sendMessage(this.chatId, firstChunkFormatted, { parse_mode: "HTML" });
+          } catch (err2) {
+            console.error("[tg] fallback finalize send error:", err2);
+          }
+        }
+      }
+      
+      // Send remaining chunks as new messages
+      for (let i = 1; i < chunks.length; i++) {
+        const formatted = markdownToHtml(chunks[i]);
+        await this.bot.api.sendMessage(this.chatId, formatted, { parse_mode: "HTML" });
+      }
+    } else {
+      // Fallback
+      for (const chunk of chunks) {
+        const formatted = markdownToHtml(chunk);
+        await this.bot.api.sendMessage(this.chatId, formatted, { parse_mode: "HTML" });
+      }
+    }
+  }
+}
 
 // --- pi RPC Client ---
 
 type RpcEvent = Record<string, unknown> & { type: string };
 
 class PiRpcClient {
+  public bot: Bot | null = null;
+  public onStreamUpdate: ((text: string) => void) | null = null;
+  private lastStreamTime = 0;
+  private streamTimeout: ReturnType<typeof setTimeout> | null = null;
   private proc: ChildProcess | null = null;
   private buffer = "";
   private pendingPrompt: {
@@ -147,6 +254,27 @@ class PiRpcClient {
     return result;
   }
 
+  private triggerStreamUpdate(text: string) {
+    if (!this.onStreamUpdate) return;
+    const now = Date.now();
+    const elapsed = now - this.lastStreamTime;
+    
+    if (this.streamTimeout) {
+      clearTimeout(this.streamTimeout);
+      this.streamTimeout = null;
+    }
+    
+    if (elapsed >= 800) {
+      this.lastStreamTime = now;
+      this.onStreamUpdate(text);
+    } else {
+      this.streamTimeout = setTimeout(() => {
+        this.lastStreamTime = Date.now();
+        this.onStreamUpdate?.(text);
+      }, 800 - elapsed);
+    }
+  }
+
   start() {
     this.spawnProcess();
   }
@@ -154,9 +282,10 @@ class PiRpcClient {
   private spawnProcess() {
     console.log("[pi] spawning pi rpc process...");
     const piBinary = detectPiBinary();
+    mkdirSync(dirname(sessionPath), { recursive: true });
     this.proc = spawn(
       piBinary,
-      ["--mode", "rpc", "--no-session"],
+      ["--mode", "rpc", "--session", sessionPath],
       { stdio: ["pipe", "pipe", "pipe"], cwd: process.env.HOME || "~" }
     );
 
@@ -218,6 +347,7 @@ class PiRpcClient {
             const filtered = delta.replace(/<\/?thinking>/g, '');
             if (filtered.trim()) {
               this.responseText += filtered;
+              this.triggerStreamUpdate(this.responseText);
             }
           }
         }
@@ -228,14 +358,19 @@ class PiRpcClient {
         const args = event.args as Record<string, unknown> | undefined;
         if (name === "bash") {
           const cmd = (args?.command as string ?? "").slice(0, 100);
-          this.responseText += `\n🔧 *bash*\n\`\`\`\n${cmd}\n\`\`\`\n`;
+          this.responseText += `\n🔧 **bash**\n\`\`\`\n${cmd}\n\`\`\`\n`;
         } else if (name === "read") {
           const path = args?.path as string ?? "";
-          this.responseText += `\n📖 *read* \`${path}\`\n`;
+          this.responseText += `\n📖 **read** \`${path}\`\n`;
         }
+        this.triggerStreamUpdate(this.responseText);
         break;
       }
       case "agent_end": {
+        if (this.streamTimeout) {
+          clearTimeout(this.streamTimeout);
+          this.streamTimeout = null;
+        }
         if (this.pendingPrompt) {
           const text = this.responseText.trim() || "(no response)";
           this.pendingPrompt.resolve(text);
@@ -275,13 +410,34 @@ class PiRpcClient {
     if (this.isProcessing || this.queue.length === 0) return;
     this.isProcessing = true;
     const { message, chatId } = this.queue.shift()!;
+    
+    const sender = this.bot ? new StreamSender(chatId, this.bot) : null;
+    if (sender) {
+      this.onStreamUpdate = (text) => {
+        const filtered = this.filterThinkingBlocks(text);
+        sender.sendUpdate(filtered).catch(() => {});
+      };
+    }
+    
     try {
       const response = await this.sendPrompt(message);
-      this.onResponse?.(response, chatId);
+      this.stopTyping();
+      const filtered = this.filterThinkingBlocks(response);
+      if (sender) {
+        await sender.finalize(filtered);
+      } else {
+        this.onResponse?.(filtered, chatId);
+      }
     } catch (err) {
       this.stopTyping(); // Stop typing on error
-      this.onResponse?.(`Error: ${err instanceof Error ? err.message : String(err)}`, chatId);
+      const errText = `Error: ${err instanceof Error ? err.message : String(err)}`;
+      if (sender) {
+        await sender.finalize(errText);
+      } else {
+        this.onResponse?.(errText, chatId);
+      }
     } finally {
+      this.onStreamUpdate = null;
       this.isProcessing = false;
       if (this.queue.length > 0) this.processQueue();
     }
@@ -299,79 +455,209 @@ class PiRpcClient {
   }
 }
 
-// --- Telegram MarkdownV2 Formatting ---
+// --- Telegram HTML Formatting ---
 
-function escapeMarkdownV2(text: string): string {
-  // Escape special characters for MarkdownV2
-  // Characters: _ * [ ] ( ) ~ ` > # + - = | { } . !
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, '\\$1');
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-function formatForTelegram(text: string): string {
-  // Split text into parts: code blocks and regular text
-  const parts: string[] = [];
-  let current = '';
-  let inCodeBlock = false;
-  let codeBlockContent = '';
-  let codeBlockLang = '';
+function convertMarkdownTables(text: string): string {
+  const lines = text.split("\n");
+  const result: string[] = [];
+  let i = 0;
 
-  const lines = text.split('\n');
+  while (i < lines.length) {
+    // Detect table: line starts with | and next line is separator (|---|)
+    if (
+      lines[i].trim().startsWith("|") &&
+      i + 1 < lines.length &&
+      /^\|[\s\-:|]+\|$/.test(lines[i + 1].trim())
+    ) {
+      // Parse header
+      const headers = lines[i]
+        .split("|")
+        .map((c) => c.trim())
+        .filter(Boolean);
 
-  for (const line of lines) {
-    // Check for code block start/end
-    if (line.startsWith('```') && !inCodeBlock) {
-      // Start of code block
-      if (current.trim()) {
-        parts.push(escapeMarkdownV2(current));
-        current = '';
+      // Skip separator line
+      i += 2;
+
+      // Parse data rows
+      const rows: string[][] = [];
+      while (i < lines.length && lines[i].trim().startsWith("|")) {
+        const cells = lines[i]
+          .split("|")
+          .map((c) => c.trim())
+          .filter(Boolean);
+        rows.push(cells);
+        i++;
       }
-      inCodeBlock = true;
-      codeBlockLang = line.slice(3).trim();
-      codeBlockContent = '';
-      continue;
-    }
 
-    if (line.startsWith('```') && inCodeBlock) {
-      // End of code block
-      inCodeBlock = false;
-      if (codeBlockLang) {
-        parts.push(`\`\`\`${codeBlockLang}\n${codeBlockContent}\n\`\`\``);
+      // Calculate column widths (using display width for CJK characters)
+      const displayWidth = (s: string) => {
+        let w = 0;
+        for (const ch of s) {
+          w += ch.charCodeAt(0) > 0x7f ? 2 : 1;
+        }
+        return w;
+      };
+
+      const colWidths = headers.map((h, col) => {
+        const maxData = rows.reduce(
+          (max, row) => Math.max(max, displayWidth(row[col] || "")),
+          0
+        );
+        return Math.max(displayWidth(h), maxData);
+      });
+
+      // Pad string to target display width
+      const pad = (s: string, w: number) => {
+        const diff = w - displayWidth(s);
+        return diff > 0 ? s + " ".repeat(diff) : s;
+      };
+
+      const separator = colWidths.map((w) => "─".repeat(w + 2)).join("┼");
+
+      const headerLine = headers
+        .map((h, col) => ` ${pad(h, colWidths[col])} `)
+        .join("│");
+      const dataLines = rows.map((row) =>
+        row
+          .map((cell, col) => ` ${pad(cell || "", colWidths[col])} `)
+          .join("│")
+      );
+
+      result.push(
+        `<pre>${escapeHtml(headerLine)}\n${escapeHtml(separator)}\n${escapeHtml(dataLines.join("\n"))}</pre>`
+      );
+    } else {
+      result.push(lines[i]);
+      i++;
+    }
+  }
+
+  return result.join("\n");
+}
+
+function markdownToHtml(text: string): string {
+  // 1. Split by code blocks
+  const parts = text.split("```");
+  const processedParts: string[] = [];
+
+  for (let i = 0; i < parts.length; i++) {
+    if (i % 2 === 1) {
+      // Inside a code block
+      const block = parts[i];
+      const firstNewLine = block.indexOf("\n");
+      let lang = "";
+      let code = block;
+      if (firstNewLine !== -1) {
+        const potentialLang = block.slice(0, firstNewLine).trim();
+        // Check if it looks like a language tag
+        if (potentialLang && /^[a-zA-Z0-9_-]+$/.test(potentialLang)) {
+          lang = potentialLang;
+          code = block.slice(firstNewLine + 1);
+        }
+      }
+      
+      // Escape HTML special characters inside code block
+      const escapedCode = code
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+        
+      if (lang) {
+        processedParts.push(`<pre><code class="language-${lang}">${escapedCode}</code></pre>`);
       } else {
-        parts.push(`\`\`\`\n${codeBlockContent}\n\`\`\``);
+        processedParts.push(`<pre>${escapedCode}</pre>`);
       }
-      codeBlockContent = '';
-      codeBlockLang = '';
-      continue;
-    }
-
-    if (inCodeBlock) {
-      codeBlockContent += (codeBlockContent ? '\n' : '') + line;
     } else {
-      current += (current ? '\n' : '') + line;
+      // Regular text block — extract tables first, protect them, then format the rest
+      const rawBlock = parts[i];
+
+      // 1. Convert markdown tables to <pre> BEFORE any other processing
+      const converted = convertMarkdownTables(rawBlock);
+
+      // 2. Protect <pre>...</pre> blocks with placeholders
+      const TABLE_PH = "\x00TBL_";
+      const savedTables: string[] = [];
+      let tblIdx = 0;
+      let block = converted.replace(/<pre>[\s\S]*?<\/pre>/g, (m) => {
+        savedTables.push(m);
+        return `${TABLE_PH}${tblIdx++}\x00`;
+      });
+
+      // 3. Escape HTML special characters (only on non-table parts)
+      block = block
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+
+      // 4. Process lines for block-level elements (headings, lists)
+      const lines = block.split("\n");
+      const processedLines = lines.map((line) => {
+        // Headings
+        const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+        if (headingMatch) {
+          return `<b>${headingMatch[2]}</b>`;
+        }
+
+        // Unordered lists
+        const listMatch = line.match(/^(\s*)[-*+]\s+(.*)$/);
+        if (listMatch) {
+          const indent = listMatch[1] || "";
+          return `${indent}• ${listMatch[2]}`;
+        }
+
+        // Ordered lists
+        const orderedListMatch = line.match(/^(\s*)(\d+\.)\s+(.*)$/);
+        if (orderedListMatch) {
+          const indent = orderedListMatch[1] || "";
+          return `${indent}${orderedListMatch[2]} ${orderedListMatch[3]}`;
+        }
+
+        return line;
+      });
+
+      let formattedBlock = processedLines.join("\n");
+
+      // 5. Inline formatting (bold, italic, links, inline code)
+      const inlineParts = formattedBlock.split("`");
+      const processedInlineParts: string[] = [];
+
+      for (let j = 0; j < inlineParts.length; j++) {
+        if (j % 2 === 1) {
+          processedInlineParts.push(`<code>${inlineParts[j]}</code>`);
+        } else {
+          let inlineText = inlineParts[j];
+          inlineText = inlineText.replace(/\*\*(.*?)\*\*/g, "<b>$1</b>");
+          inlineText = inlineText.replace(/__(.*?)__/g, "<b>$1</b>");
+          inlineText = inlineText.replace(/\*(.*?)\*/g, "<i>$1</i>");
+          inlineText = inlineText.replace(/_(.*?)_/g, "<i>$1</i>");
+          inlineText = inlineText.replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>');
+          processedInlineParts.push(inlineText);
+        }
+      }
+
+      // 6. Restore <pre> table blocks
+      let result = processedInlineParts.join("");
+      result = result.replace(/\x00TBL_(\d+)\x00/g, (_, idx) => savedTables[parseInt(idx)]);
+
+      processedParts.push(result);
     }
   }
 
-  // Handle unclosed code block
-  if (inCodeBlock) {
-    if (codeBlockLang) {
-      parts.push(`\`\`\`${codeBlockLang}\n${codeBlockContent}\n\`\`\``);
-    } else {
-      parts.push(`\`\`\`\n${codeBlockContent}\n\`\`\``);
-    }
-  }
-
-  // Add remaining text
-  if (current.trim()) {
-    parts.push(escapeMarkdownV2(current));
-  }
-
-  return parts.join('\n');
+  return processedParts.join("");
 }
 
 // --- Telegram Bot with 409 retry ---
 
 async function startBot(pi: PiRpcClient): Promise<void> {
   const bot = new Bot(config.botToken);
+  pi.bot = bot;
 
   bot.on("message:text", async (ctx) => {
     const chatId = ctx.chat.id;
@@ -393,6 +679,30 @@ async function startBot(pi: PiRpcClient): Promise<void> {
       } else {
         await ctx.reply("pi process not running.");
       }
+      return;
+    }
+    if (text === "/compact") {
+      if (pi["proc"]?.stdin?.writable) {
+        pi["proc"].stdin.write(JSON.stringify({ type: "compact" }) + "\n");
+        await ctx.reply("Compaction command sent.");
+      } else {
+        await ctx.reply("pi process not running.");
+      }
+      return;
+    }
+    if (text === "/clear") {
+      await ctx.reply("Clearing session and starting a new one...");
+      pi.stop();
+      try {
+        if (existsSync(sessionPath)) {
+          const backupPath = sessionPath.replace(/\.jsonl$/, `.backup-${Date.now()}.jsonl`);
+          renameSync(sessionPath, backupPath);
+        }
+      } catch (err) {
+        console.error("[tg] failed to clear session:", err);
+      }
+      pi.start();
+      await ctx.reply("New session started.");
       return;
     }
 
@@ -417,12 +727,12 @@ async function startBot(pi: PiRpcClient): Promise<void> {
     console.log(`[tg] -> ${filteredText.slice(0, 100)}`);
     for (const chunk of splitMessage(filteredText, 4096)) {
       try {
-        // Try to send with MarkdownV2 format
-        const formattedChunk = formatForTelegram(chunk);
-        await bot.api.sendMessage(chatId, formattedChunk, { parse_mode: "MarkdownV2" });
+        // Try to send with HTML format
+        const formattedChunk = markdownToHtml(chunk);
+        await bot.api.sendMessage(chatId, formattedChunk, { parse_mode: "HTML" });
       } catch (err) {
-        // If MarkdownV2 fails, send as plain text
-        console.error("[tg] markdown error, sending as plain text:", err);
+        // If HTML fails, send as plain text
+        console.error("[tg] html formatting error, sending as plain text:", err);
         try { await bot.api.sendMessage(chatId, chunk); }
         catch (err2) { console.error("[tg] send error:", err2); }
       }

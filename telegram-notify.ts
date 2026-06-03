@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { readFileSync, existsSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, realpathSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, mkdirSync, unlinkSync, openSync, closeSync, realpathSync, statSync, readdirSync } from "node:fs";
 import { resolve, dirname, join } from "node:path";
 import { spawn, execSync } from "node:child_process";
 import { platform } from "node:os";
@@ -253,6 +253,54 @@ function checkConfig(config: TelegramConfig): string {
     `Bot Token: ${masked}`,
     `Chat ID: ${config.chatId}`,
   ].join("\n");
+}
+
+function getSessionStats(config: TelegramConfig): string {
+  const home = process.env.HOME ?? "~";
+  const sessionsDir = resolve(home, ".pi", "agent", "sessions", "telegram");
+  const activeSessionPath = resolve(sessionsDir, `chat-${config.chatId}.jsonl`);
+  
+  const lines: string[] = ["=== Sessions Information ==="];
+  
+  if (existsSync(activeSessionPath)) {
+    try {
+      const stats = statSync(activeSessionPath);
+      const content = readFileSync(activeSessionPath, "utf-8");
+      const eventCount = content.split("\n").filter(Boolean).length;
+      lines.push(`Active Session: chat-${config.chatId}.jsonl`);
+      lines.push(`  Size: ${(stats.size / 1024).toFixed(2)} KB`);
+      lines.push(`  Messages/Events: ${eventCount}`);
+      lines.push(`  Last Updated: ${stats.mtime.toLocaleString()}`);
+    } catch (e) {
+      lines.push(`Active Session: Found but failed to read (${e instanceof Error ? e.message : String(e)})`);
+    }
+  } else {
+    lines.push(`Active Session: None (chat-${config.chatId}.jsonl does not exist yet)`);
+  }
+  
+  // List backups
+  try {
+    if (existsSync(sessionsDir)) {
+      const files = readdirSync(sessionsDir);
+      const backups = files.filter(f => f.startsWith(`chat-${config.chatId}.backup-`));
+      if (backups.length > 0) {
+        lines.push(`\nBackup Sessions (${backups.length}):`);
+        for (const file of backups) {
+          const filePath = resolve(sessionsDir, file);
+          const stats = statSync(filePath);
+          const dateStr = file.split(".backup-")[1]?.replace(".jsonl", "") ?? "";
+          const formattedDate = dateStr ? new Date(parseInt(dateStr, 10)).toLocaleString() : stats.mtime.toLocaleString();
+          lines.push(`  - ${file} (${(stats.size / 1024).toFixed(2)} KB, Backed up: ${formattedDate})`);
+        }
+      } else {
+        lines.push("\nBackup Sessions: None");
+      }
+    }
+  } catch (e) {
+    lines.push(`\nFailed to list backups: ${e instanceof Error ? e.message : String(e)}`);
+  }
+  
+  return lines.join("\n");
 }
 
 async function setupWizard(ctx: any): Promise<TelegramConfig | null> {
@@ -945,7 +993,8 @@ export default function (pi: ExtensionAPI) {
         case "检查配置": {
           const info = checkConfig(config);
           const serviceInfo = getServiceStatus();
-          ctx.ui.notify(`${info}\n\n${serviceInfo}`, "info");
+          const sessionStats = getSessionStats(config);
+          ctx.ui.notify(`${info}\n\n${serviceInfo}\n\n${sessionStats}`, "info");
           break;
         }
         case "卸载服务": {
