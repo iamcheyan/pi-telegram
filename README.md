@@ -64,13 +64,20 @@ npm start
    /tg
    ```
 
-   This will show the Telegram management menu with options to:
+3. If no configuration is found, a setup wizard will guide you through:
+   - Creating a Telegram bot with @BotFather
+   - Getting your chat ID
+   - Testing the connection
+   - Saving the configuration
+
+4. After configuration, the management menu will show:
    - View bot status
    - Send test messages
    - Restart bridge service
    - Stop bridge service
    - View bridge logs
    - Check configuration
+   - Uninstall service
 
 ### Auto-start on Boot
 
@@ -80,6 +87,15 @@ The plugin supports automatic startup on system boot:
 - **Linux**: Uses systemd service
 
 To enable auto-start, use the `/tg` command in pi and select "Restart Bridge Service".
+
+### Uninstalling
+
+To uninstall the Telegram bridge:
+
+1. Run `/tg` in pi
+2. Select "卸载服务" (Uninstall Service)
+3. Confirm the uninstallation
+4. Manually delete the plugin directory and config files if no longer needed
 
 ## Configuration
 

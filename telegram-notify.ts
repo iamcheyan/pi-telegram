@@ -244,6 +244,127 @@ function checkConfig(config: TelegramConfig): string {
   ].join("\n");
 }
 
+async function setupWizard(ctx: any): Promise<TelegramConfig | null> {
+  ctx.ui.notify("=== Telegram Bridge Setup ===", "info");
+  ctx.ui.notify("Let's configure your Telegram bot connection.", "info");
+
+  // Step 1: Get bot token
+  ctx.ui.notify("", "info");
+  ctx.ui.notify("Step 1: Create a Telegram Bot", "info");
+  ctx.ui.notify("1. Open Telegram and search for @BotFather", "info");
+  ctx.ui.notify("2. Send /newbot and follow the instructions", "info");
+  ctx.ui.notify("3. Copy the bot token you receive", "info");
+  ctx.ui.notify("", "info");
+
+  const botToken = await ctx.ui.input("Bot Token", "Enter your bot token from @BotFather");
+  if (!botToken) {
+    ctx.ui.notify("Setup cancelled.", "error");
+    return null;
+  }
+
+  // Step 2: Get chat ID
+  ctx.ui.notify("", "info");
+  ctx.ui.notify("Step 2: Get your Chat ID", "info");
+  ctx.ui.notify("1. Send any message to your new bot", "info");
+  ctx.ui.notify("2. Visit https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates", "info");
+  ctx.ui.notify("3. Find your chat.id in the response", "info");
+  ctx.ui.notify("", "info");
+
+  const chatId = await ctx.ui.input("Chat ID", "Enter your chat ID");
+  if (!chatId) {
+    ctx.ui.notify("Setup cancelled.", "error");
+    return null;
+  }
+
+  // Step 3: Test connection
+  ctx.ui.notify("", "info");
+  ctx.ui.notify("Step 3: Testing connection...", "info");
+
+  const testResult = await sendTelegramMessage(botToken, chatId, "Telegram Bridge setup test successful!");
+  if (!testResult.ok) {
+    ctx.ui.notify(`Failed to send test message: ${testResult.error}`, "error");
+    ctx.ui.notify("Please check your bot token and chat ID.", "error");
+    return null;
+  }
+
+  ctx.ui.notify("Test message sent successfully!", "info");
+
+  // Step 4: Ask user to reply
+  ctx.ui.notify("", "info");
+  ctx.ui.notify("Step 4: Verify connection", "info");
+  ctx.ui.notify("Please reply to the test message in Telegram.", "info");
+  ctx.ui.notify("Press Enter here after you've replied...", "info");
+
+  await ctx.ui.input("Continue", "Press Enter after replying");
+
+  // Step 5: Save configuration
+  const config: TelegramConfig = { botToken, chatId };
+  const scriptDir = getScriptDir();
+  const configPath = resolve(scriptDir, "telegram-config.json");
+
+  try {
+    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    ctx.ui.notify(`Configuration saved to: ${configPath}`, "info");
+  } catch (e) {
+    ctx.ui.notify(`Failed to save config: ${e instanceof Error ? e.message : String(e)}`, "error");
+    return null;
+  }
+
+  ctx.ui.notify("", "info");
+  ctx.ui.notify("=== Setup Complete ===", "info");
+  ctx.ui.notify("Your Telegram bridge is now configured!", "info");
+
+  return config;
+}
+
+function uninstallAll(): string {
+  const messages: string[] = [];
+
+  // 1. Stop bridge
+  const stopResult = stopBridge();
+  messages.push(stopResult);
+
+  // 2. Uninstall service
+  const uninstallResult = uninstallService();
+  messages.push(uninstallResult);
+
+  // 3. Remove extension symlink
+  const home = process.env.HOME ?? "~";
+  const extensionPath = resolve(home, ".pi", "agent", "extensions", "telegram-notify.ts");
+
+  try {
+    if (existsSync(extensionPath)) {
+      unlinkSync(extensionPath);
+      messages.push(`Removed extension symlink: ${extensionPath}`);
+    }
+  } catch (e) {
+    messages.push(`Warning: Could not remove extension symlink: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  // 4. Remove PID file
+  try {
+    if (existsSync(PID_FILE)) {
+      unlinkSync(PID_FILE);
+      messages.push(`Removed PID file: ${PID_FILE}`);
+    }
+  } catch {}
+
+  // 5. Show cleanup instructions
+  messages.push("");
+  messages.push("=== Uninstall Complete ===");
+  messages.push("");
+  messages.push("The following files can be manually deleted if no longer needed:");
+  messages.push(`  - Plugin directory: ${getScriptDir()}`);
+  messages.push(`  - Config file: ${resolve(getScriptDir(), "telegram-config.json")}`);
+  messages.push(`  - Log file: ${LOG_FILE}`);
+  messages.push("");
+  messages.push("To delete everything, run:");
+  messages.push(`  rm -rf ${getScriptDir()}`);
+  messages.push(`  rm -f ${LOG_FILE}`);
+
+  return messages.join("\n");
+}
+
 // --- Launchd Service Management (macOS) ---
 
 const LAUNCHD_LABEL = "com.pi.telegram-bridge";
@@ -677,13 +798,13 @@ async function restartBridge(): Promise<string> {
 // --- Extension ---
 
 export default function (pi: ExtensionAPI) {
-  let config: TelegramConfig;
+  let config: TelegramConfig | null = null;
+
+  // Try to load config, show setup wizard if not found
   try {
     config = loadConfig();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error(`[telegram-notify] ${msg}`);
-    return;
+  } catch {
+    // Config not found, will show setup wizard
   }
 
   pi.registerTool({
@@ -707,6 +828,13 @@ export default function (pi: ExtensionAPI) {
       ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      if (!config) {
+        return {
+          content: [{ type: "text", text: "Telegram not configured. Run /tg to set up." }],
+          isError: true,
+        };
+      }
+
       const text = params.message.slice(0, 4096);
       const result = await sendTelegramMessage(
         config.botToken,
@@ -744,6 +872,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tg", {
     description: "Telegram management menu (or /tg <message> to send directly)",
     handler: async (args, ctx) => {
+      // If no config, show setup wizard
+      if (!config) {
+        ctx.ui.notify("Telegram not configured. Starting setup wizard...", "info");
+        config = await setupWizard(ctx);
+        if (!config) return;
+      }
+
       // If args provided, send message directly (backward compatible)
       if (args) {
         const result = await sendTelegramMessage(config.botToken, config.chatId, args);
@@ -768,6 +903,7 @@ export default function (pi: ExtensionAPI) {
         "停止 Bridge 服务",
         "查看 Bridge 日志",
         "检查配置",
+        "卸载服务",
       ];
 
       const choice = await ctx.ui.select("Telegram 管理", MENU_OPTIONS);
@@ -799,6 +935,14 @@ export default function (pi: ExtensionAPI) {
           const info = checkConfig(config);
           const serviceInfo = getServiceStatus();
           ctx.ui.notify(`${info}\n\n${serviceInfo}`, "info");
+          break;
+        }
+        case "卸载服务": {
+          const confirmed = await ctx.ui.confirm("卸载确认", "确定要卸载 Telegram Bridge 服务吗？这将停止服务并移除所有配置。");
+          if (confirmed) {
+            const result = uninstallAll();
+            ctx.ui.notify(result, "info");
+          }
           break;
         }
       }
