@@ -78,21 +78,32 @@ const PID_FILE = resolve(PID_DIR, "telegram-bridge.pid");
 const LOG_FILE = resolve(PID_DIR, "telegram-bridge.log");
 
 function getBridgePid(): number | null {
+  // First check PID file
   try {
-    if (!existsSync(PID_FILE)) return null;
-    const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
-    if (isNaN(pid)) return null;
-    // Check if process is alive
-    try {
-      process.kill(pid, 0);
-      return pid;
-    } catch {
-      // Process not running, clean up stale PID file
-      return null;
+    if (existsSync(PID_FILE)) {
+      const pid = parseInt(readFileSync(PID_FILE, "utf-8").trim(), 10);
+      if (!isNaN(pid)) {
+        try {
+          process.kill(pid, 0);
+          return pid;
+        } catch {
+          // Process not running, clean up stale PID file
+          try { unlinkSync(PID_FILE); } catch {}
+        }
+      }
     }
-  } catch {
-    return null;
-  }
+  } catch {}
+
+  // Fallback: check for running telegram-bridge process
+  try {
+    const output = execSync('pgrep -f "telegram-bridge.ts"', { encoding: "utf-8" }).trim();
+    const pids = output.split('\n').filter(Boolean);
+    if (pids.length > 0) {
+      return parseInt(pids[0], 10);
+    }
+  } catch {}
+
+  return null;
 }
 
 function isBridgeRunning(): boolean {
