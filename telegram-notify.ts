@@ -303,104 +303,120 @@ function getSessionStats(config: TelegramConfig): string {
   return lines.join("\n");
 }
 
-async function setupWizard(ctx: any): Promise<TelegramConfig | null> {
-  ctx.ui.notify("=== Telegram Bridge Setup ===", "info");
-  ctx.ui.notify("Let's configure your Telegram bot connection.", "info");
+function showBanner(ctx: any) {
+  const banner = [
+    "           _       __       ",
+    "    ____  (_)     / /_____ _",
+    "   / __ \\/ /_____/ __/ __ `/",
+    "  / /_/ / /_____/ /_/ /_/ / ",
+    " / .___/_/      \\__/\\__, /  ",
+    "/_/                /____/   ",
+    ""
+  ].join("\n");
+  ctx.ui.notify(banner, "info");
+}
 
-  // Step 1: Get bot token
-  ctx.ui.notify("", "info");
-  ctx.ui.notify("Step 1: Create a Telegram Bot", "info");
-  ctx.ui.notify("1. Open Telegram and search for @BotFather", "info");
-  ctx.ui.notify("2. Send /newbot and follow the instructions", "info");
-  ctx.ui.notify("3. Copy the bot token you receive", "info");
-  ctx.ui.notify("", "info");
+async function setupWizard(ctx: any, pi: ExtensionAPI): Promise<TelegramConfig | null> {
+  const bannerText = [
+    "           _       __       ",
+    "    ____  (_)     / /_____ _",
+    "   / __ \\/ /_____/ __/ __ `/",
+    "  / /_/ / /_____/ /_/ /_/ / ",
+    " / .___/_/      \\__/\\__, /  ",
+    "/_/                /____/   ",
+    "",
+    "=== Telegram Bridge 配置向导 ===",
+    "",
+    "步骤 1/3: 获取 Bot Token",
+    "  打开 Telegram，搜索 @BotFather，发送 /newbot",
+    "  按提示创建机器人后，复制收到的 Token"
+  ].join("\n");
+  
+  ctx.ui.notify(bannerText, "info");
 
-  const botToken = await ctx.ui.input("Bot Token", "Enter your bot token from @BotFather");
-  if (!botToken) {
-    ctx.ui.notify("Setup cancelled.", "error");
+  const botToken = await ctx.ui.input("输入 Bot Token", "例如: 123456:ABC-DEF...");
+  if (!botToken?.trim()) {
+    ctx.ui.notify("已取消配置。", "error");
     return null;
   }
 
-  // Step 2: Get chat ID
-  ctx.ui.notify("", "info");
-  ctx.ui.notify("Step 2: Get your Chat ID", "info");
-  ctx.ui.notify("1. Send any message to your new bot", "info");
-  ctx.ui.notify("2. Visit https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates", "info");
-  ctx.ui.notify("3. Find your chat.id in the response", "info");
-  ctx.ui.notify("", "info");
+  // Step 2: Chat ID
+  const step2Text = [
+    "",
+    "步骤 2/3: 获取 Chat ID",
+    "  先给你的 Bot 发一条消息",
+    "  然后浏览器打开:",
+    `  https://api.telegram.org/bot${botToken.trim()}/getUpdates`,
+    "  找到 chat.id 那个数字"
+  ].join("\n");
+  ctx.ui.notify(step2Text, "info");
 
-  const chatId = await ctx.ui.input("Chat ID", "Enter your chat ID");
-  if (!chatId) {
-    ctx.ui.notify("Setup cancelled.", "error");
+  const chatId = await ctx.ui.input("输入 Chat ID", "例如: 123456789");
+  if (!chatId?.trim()) {
+    ctx.ui.notify("已取消配置。", "error");
     return null;
   }
 
   // Step 3: Test connection
-  ctx.ui.notify("", "info");
-  ctx.ui.notify("Step 3: Testing connection...", "info");
+  ctx.ui.notify("步骤 3/3: 测试连接...", "info");
 
-  const testResult = await sendTelegramMessage(botToken, chatId, "Telegram Bridge setup test successful!");
+  const testResult = await sendTelegramMessage(botToken.trim(), chatId.trim(), "Telegram Bridge 配置测试成功！");
   if (!testResult.ok) {
-    ctx.ui.notify(`Failed to send test message: ${testResult.error}`, "error");
-    ctx.ui.notify("Please check your bot token and chat ID.", "error");
+    const errText = [
+      `发送失败: ${testResult.error}`,
+      "请检查 Token 和 Chat ID 是否正确。"
+    ].join("\n");
+    ctx.ui.notify(errText, "error");
     return null;
   }
 
-  ctx.ui.notify("Test message sent successfully!", "info");
+  ctx.ui.notify("  测试消息已发送到 Telegram，请确认是否收到。", "info");
 
-  // Step 4: Ask user to reply
-  ctx.ui.notify("", "info");
-  ctx.ui.notify("Step 4: Verify connection", "info");
-  ctx.ui.notify("Please reply to the test message in Telegram.", "info");
-  ctx.ui.notify("Press Enter here after you've replied...", "info");
-
-  await ctx.ui.input("Continue", "Press Enter after replying");
-
-  // Step 5: Save configuration
-  const config: TelegramConfig = { botToken, chatId };
+  // Save configuration
+  const newConfig: TelegramConfig = { botToken: botToken.trim(), chatId: chatId.trim() };
   const scriptDir = getScriptDir();
   const configPath = resolve(scriptDir, "telegram-config.json");
 
   try {
-    writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
-    ctx.ui.notify(`Configuration saved to: ${configPath}`, "info");
+    writeFileSync(configPath, JSON.stringify(newConfig, null, 2), "utf-8");
   } catch (e) {
-    ctx.ui.notify(`Failed to save config: ${e instanceof Error ? e.message : String(e)}`, "error");
+    ctx.ui.notify(`保存配置失败: ${e instanceof Error ? e.message : String(e)}`, "error");
     return null;
   }
 
-  ctx.ui.notify("", "info");
-  ctx.ui.notify("=== Setup Complete ===", "info");
-  ctx.ui.notify("Your Telegram bridge is now configured!", "info");
+  const successText = [
+    "",
+    "=== 配置完成 ===",
+    `配置已保存到: ${configPath}`
+  ].join("\n");
+  ctx.ui.notify(successText, "info");
 
-  return config;
+  // Ask if user wants to start bridge now
+  const startNow = await ctx.ui.confirm("启动服务", "是否现在启动 Bridge 服务？");
+  if (startNow) {
+    ctx.ui.notify("正在启动 Bridge...", "info");
+    const result = await restartBridge();
+    ctx.ui.notify(result, "info");
+    try { await pi.reload(); } catch {}
+  } else {
+    ctx.ui.notify("稍后可通过 /tg 菜单启动服务。", "info");
+  }
+
+  return newConfig;
 }
 
-function uninstallAll(): string {
+async function uninstallAll(ctx: any, pi: ExtensionAPI): Promise<string> {
   const messages: string[] = [];
 
-  // 1. Stop bridge
+  // 1. Stop bridge process
   const stopResult = stopBridge();
   messages.push(stopResult);
 
-  // 2. Uninstall service
+  // 2. Uninstall launchd/systemd service
   const uninstallResult = uninstallService();
   messages.push(uninstallResult);
 
-  // 3. Remove extension symlink
-  const home = process.env.HOME ?? "~";
-  const extensionPath = resolve(home, ".pi", "agent", "extensions", "telegram-notify.ts");
-
-  try {
-    if (existsSync(extensionPath)) {
-      unlinkSync(extensionPath);
-      messages.push(`Removed extension symlink: ${extensionPath}`);
-    }
-  } catch (e) {
-    messages.push(`Warning: Could not remove extension symlink: ${e instanceof Error ? e.message : String(e)}`);
-  }
-
-  // 4. Remove PID file
+  // 3. Remove PID file
   try {
     if (existsSync(PID_FILE)) {
       unlinkSync(PID_FILE);
@@ -408,18 +424,42 @@ function uninstallAll(): string {
     }
   } catch {}
 
-  // 5. Show cleanup instructions
+  // 4. Remove log file
+  try {
+    if (existsSync(LOG_FILE)) {
+      unlinkSync(LOG_FILE);
+      messages.push(`Removed log file: ${LOG_FILE}`);
+    }
+  } catch {}
+
+  // 5. Ask if user wants to delete config
+  const scriptDir = getScriptDir();
+  const configPath = resolve(scriptDir, "telegram-config.json");
+  if (existsSync(configPath)) {
+    const deleteConfig = await ctx.ui.confirm(
+      "删除配置",
+      "是否同时删除 Bot Token 和 Chat ID 等配置信息？\n删除后需要重新配置才能使用。"
+    );
+    if (deleteConfig) {
+      try {
+        unlinkSync(configPath);
+        messages.push(`Removed config: ${configPath}`);
+        // Clear in-memory config so /tg shows setup wizard next time
+        config = null;
+      } catch (e) {
+        messages.push(`Warning: could not remove config: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else {
+      messages.push("配置已保留，下次安装时可直接使用。");
+    }
+  }
+
   messages.push("");
-  messages.push("=== Uninstall Complete ===");
-  messages.push("");
-  messages.push("The following files can be manually deleted if no longer needed:");
-  messages.push(`  - Plugin directory: ${getScriptDir()}`);
-  messages.push(`  - Config file: ${resolve(getScriptDir(), "telegram-config.json")}`);
-  messages.push(`  - Log file: ${LOG_FILE}`);
-  messages.push("");
-  messages.push("To delete everything, run:");
-  messages.push(`  rm -rf ${getScriptDir()}`);
-  messages.push(`  rm -f ${LOG_FILE}`);
+  messages.push("=== 卸载完成 ===");
+  messages.push("所有后台服务已停止。扩展仍可通过 /tg 命令重新安装。");
+
+  // Reload pi to reflect changes
+  try { await pi.reload(); } catch {}
 
   return messages.join("\n");
 }
@@ -502,24 +542,32 @@ function uninstallLaunchdService(): string {
   }
 
   const plistPath = getLaunchdPlistPath();
+  const messages: string[] = [];
 
-  if (!existsSync(plistPath)) {
-    return "Launchd service is not installed.";
+  // Always try to remove the service by label (works even if plist is missing)
+  try {
+    execSync(`launchctl remove ${LAUNCHD_LABEL}`, { encoding: "utf-8" });
+    messages.push("Service removed from launchd.");
+  } catch {
+    // Service might not be loaded — that's fine
   }
 
-  try {
-    // Unload the service first
+  // Also try unload by plist path if it exists
+  if (existsSync(plistPath)) {
     try {
       execSync(`launchctl unload "${plistPath}"`, { encoding: "utf-8" });
     } catch {
-      // Service might not be loaded
+      // Already removed or not loaded
     }
-
-    unlinkSync(plistPath);
-    return "Launchd service uninstalled.";
-  } catch (e) {
-    return `Error uninstalling launchd service: ${e instanceof Error ? e.message : String(e)}`;
+    try {
+      unlinkSync(plistPath);
+      messages.push("Plist file removed.");
+    } catch (e) {
+      messages.push(`Warning: could not remove plist: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
+
+  return messages.length > 0 ? messages.join("\n") : "Launchd service was not installed.";
 }
 
 function loadLaunchdService(): string {
@@ -931,10 +979,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("tg", {
     description: "Telegram management menu (or /tg <message> to send directly)",
     handler: async (args, ctx) => {
+      showBanner(ctx);
+
       // If no config, show setup wizard
       if (!config) {
         ctx.ui.notify("Telegram not configured. Starting setup wizard...", "info");
-        config = await setupWizard(ctx);
+        config = await setupWizard(ctx, pi);
         if (!config) return;
       }
 
@@ -949,61 +999,94 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Show status first
-      ctx.ui.notify("Checking bot status...", "info");
-      const status = await checkBotStatus(config.botToken);
-      const serviceStatus = getServiceStatus();
-      ctx.ui.notify(`${status}\n\n${serviceStatus}`, "info");
+      // Check if bridge is actually installed (service + process)
+      const bridgeRunning = isBridgeRunning();
+      const serviceInstalled = isServiceInstalled();
+      const isActive = bridgeRunning || serviceInstalled;
 
-      // Interactive menu
-      const MENU_OPTIONS = [
-        "发送测试消息",
-        "重启 Bridge 服务",
-        "停止 Bridge 服务",
-        "查看 Bridge 日志",
-        "检查配置",
-        "卸载服务",
-      ];
+      if (isActive) {
+        // Service is active — show management menu
+        ctx.ui.notify("Checking bot status...", "info");
+        const status = await checkBotStatus(config.botToken);
+        const serviceStatus = getServiceStatus();
+        ctx.ui.notify(`${status}\n\n${serviceStatus}`, "info");
 
-      const choice = await ctx.ui.select("Telegram 管理", MENU_OPTIONS);
-      if (!choice) return;
+        const MENU_OPTIONS = [
+          "发送测试消息",
+          "重启 Bridge 服务",
+          "停止 Bridge 服务",
+          "查看 Bridge 日志",
+          "检查配置",
+          "卸载服务",
+        ];
 
-      switch (choice) {
-        case "发送测试消息": {
-          const result = await sendTestMessage(config.botToken, config.chatId);
-          ctx.ui.notify(result, result.includes("success") ? "info" : "error");
-          break;
-        }
-        case "重启 Bridge 服务": {
-          ctx.ui.notify("Restarting bridge and configuring auto-start...", "info");
-          const result = await restartBridge();
-          ctx.ui.notify(result, "info");
-          break;
-        }
-        case "停止 Bridge 服务": {
-          const result = stopBridge();
-          ctx.ui.notify(result, result.includes("stopped") ? "info" : "error");
-          break;
-        }
-        case "查看 Bridge 日志": {
-          const logs = viewBridgeLogs();
-          ctx.ui.notify(logs, "info");
-          break;
-        }
-        case "检查配置": {
-          const info = checkConfig(config);
-          const serviceInfo = getServiceStatus();
-          const sessionStats = getSessionStats(config);
-          ctx.ui.notify(`${info}\n\n${serviceInfo}\n\n${sessionStats}`, "info");
-          break;
-        }
-        case "卸载服务": {
-          const confirmed = await ctx.ui.confirm("卸载确认", "确定要卸载 Telegram Bridge 服务吗？这将停止服务并移除所有配置。");
-          if (confirmed) {
-            const result = uninstallAll();
-            ctx.ui.notify(result, "info");
+        const choice = await ctx.ui.select("Telegram 管理", MENU_OPTIONS);
+        if (!choice) return;
+
+        switch (choice) {
+          case "发送测试消息": {
+            const result = await sendTestMessage(config.botToken, config.chatId);
+            ctx.ui.notify(result, result.includes("success") ? "info" : "error");
+            break;
           }
-          break;
+          case "重启 Bridge 服务": {
+            ctx.ui.notify("Restarting bridge and configuring auto-start...", "info");
+            const result = await restartBridge();
+            ctx.ui.notify(result, "info");
+            break;
+          }
+          case "停止 Bridge 服务": {
+            const result = stopBridge();
+            ctx.ui.notify(result, result.includes("stopped") ? "info" : "error");
+            break;
+          }
+          case "查看 Bridge 日志": {
+            const logs = viewBridgeLogs();
+            ctx.ui.notify(logs, "info");
+            break;
+          }
+          case "检查配置": {
+            const info = checkConfig(config);
+            const serviceInfo = getServiceStatus();
+            const sessionStats = getSessionStats(config);
+            ctx.ui.notify(`${info}\n\n${serviceInfo}\n\n${sessionStats}`, "info");
+            break;
+          }
+          case "卸载服务": {
+            const confirmed = await ctx.ui.confirm("卸载确认", "确定要卸载 Telegram Bridge 服务吗？这将停止所有后台服务。");
+            if (confirmed) {
+              const result = await uninstallAll(ctx, pi);
+              ctx.ui.notify(result, "info");
+            }
+            break;
+          }
+        }
+      } else {
+        // Service not active — show install options
+        const status = await checkBotStatus(config.botToken);
+        ctx.ui.notify(`${status}\n\nBridge: 未安装`, "info");
+
+        const MENU_OPTIONS = [
+          "安装 Bridge 服务",
+          "检查配置",
+        ];
+
+        const choice = await ctx.ui.select("Telegram 管理", MENU_OPTIONS);
+        if (!choice) return;
+
+        switch (choice) {
+          case "安装 Bridge 服务": {
+            ctx.ui.notify("Installing bridge and configuring auto-start...", "info");
+            const result = await restartBridge();
+            ctx.ui.notify(result, "info");
+            try { await pi.reload(); } catch {}
+            break;
+          }
+          case "检查配置": {
+            const info = checkConfig(config);
+            ctx.ui.notify(info, "info");
+            break;
+          }
         }
       }
     },

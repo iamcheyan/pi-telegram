@@ -496,43 +496,30 @@ function convertMarkdownTables(text: string): string {
         i++;
       }
 
-      // Calculate column widths (using display width for CJK characters)
-      const displayWidth = (s: string) => {
-        let w = 0;
-        for (const ch of s) {
-          w += ch.charCodeAt(0) > 0x7f ? 2 : 1;
+      if (headers.length > 0 && rows.length > 0) {
+        const tableLines: string[] = [];
+        const colCount = headers.length;
+
+        if (colCount === 2) {
+          tableLines.push(`**${headers[0]} / ${headers[1]}**`);
+          for (const row of rows) {
+            const key = row[0] || "";
+            const val = row[1] || "";
+            tableLines.push(`- **${key}**: ${val}`);
+          }
+        } else {
+          for (const row of rows) {
+            const rowHeader = row[0] || "";
+            tableLines.push(`**${headers[0]}: ${rowHeader}**`);
+            for (let c = 1; c < colCount; c++) {
+              const colHeader = headers[c] || `Column ${c + 1}`;
+              const colValue = row[c] || "";
+              tableLines.push(`  - *${colHeader}*: ${colValue}`);
+            }
+          }
         }
-        return w;
-      };
-
-      const colWidths = headers.map((h, col) => {
-        const maxData = rows.reduce(
-          (max, row) => Math.max(max, displayWidth(row[col] || "")),
-          0
-        );
-        return Math.max(displayWidth(h), maxData);
-      });
-
-      // Pad string to target display width
-      const pad = (s: string, w: number) => {
-        const diff = w - displayWidth(s);
-        return diff > 0 ? s + " ".repeat(diff) : s;
-      };
-
-      const separator = colWidths.map((w) => "─".repeat(w + 2)).join("┼");
-
-      const headerLine = headers
-        .map((h, col) => ` ${pad(h, colWidths[col])} `)
-        .join("│");
-      const dataLines = rows.map((row) =>
-        row
-          .map((cell, col) => ` ${pad(cell || "", colWidths[col])} `)
-          .join("│")
-      );
-
-      result.push(
-        `<pre>${escapeHtml(headerLine)}\n${escapeHtml(separator)}\n${escapeHtml(dataLines.join("\n"))}</pre>`
-      );
+        result.push(tableLines.join("\n"));
+      }
     } else {
       result.push(lines[i]);
       i++;
